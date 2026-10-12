@@ -92,6 +92,6 @@ python scripts/bench_infer.py --checkpoint runs/bert-typed-decisions
 
 ## 本次 test 结果
 
-2000 条官方测试决策，校准后准确率 0.559，KL 0.253，Brier 0.144，ECE 0.061。分题型准确率：choice 0.527，noul 0.615，score 0.540。
+2000 条官方测试决策，6 个 epoch 的检查点校准后准确率 0.648，KL 0.193，Brier 0.109，ECE 0.084。分题型准确率：choice 0.580，noul 0.747，score 0.625。
 
-同一次官方 test 上，Jev 1.13.0 公布准确率 0.727，Laya typed-decisions 公布 0.766。Laya 的分题型准确率是 choice 0.733、noul 0.857、score 0.723。Jev 没有公布分题型数字。Apple M1 上热身后的单题推理 p50 是 33.7 ms；Laya 英文检查点在 Tesla T4 上的对应公布值是 39.5 ms。设备、检查点和计时口径不同，完整对照在 [docs/comparison.md](docs/comparison.md)。
+同一次官方 test 上，Jev 1.13.0 公布准确率 0.727，Laya typed-decisions 公布 0.766，数据集卡上的 ModernBERT-base 分工作流专家是 0.646。Laya 的分题型准确率是 choice 0.733、noul 0.857、score 0.723。Jev 没有公布分题型数字。Apple M1 上热身后的单题推理 p50 是 33.7 ms；Laya 英文检查点在 Tesla T4 上的对应公布值是 39.5 ms。设备、检查点和计时口径不同，完整对照在 [docs/comparison.md](docs/comparison.md)。
