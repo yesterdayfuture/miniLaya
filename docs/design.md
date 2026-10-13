@@ -2,7 +2,7 @@
 
 miniLaya 把预训练 BERT 微调成非自回归的类型化决策模型。一道题的全部选项在同一次双向编码里打分，再变成 Laya 形式的 `choice`、`score` 或 `noul`。
 
-参考实现是 [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya)。Laya 用 ModernBERT 或 mmBERT 编码器、RLCD 损失和按题型与选项数分桶的温度。本仓库换成 `bert-base-uncased`、金标分布上的 soft cross-entropy，以及每种题型一个标量温度。Jev 是闭源托管接口，权重、奖励和结构都未公开，不能作为微调起点。
+参考实现是 [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya)。Laya 用 ModernBERT 或 mmBERT 编码器、RLCD 损失和按题型与选项数分桶的温度。本仓库的默认训练是 `bert-base-uncased` 加上金标分布上的 soft cross-entropy，温度是每种题型一个标量。`scripts/train_rlcd.py` 在同一套模型和数据上另跑一次 RLCD，检查点分开保存。Jev 是闭源托管接口，权重、奖励和结构都未公开，不能作为微调起点。
 
 ## 模块
 
@@ -13,7 +13,8 @@ miniLaya 把预训练 BERT 微调成非自回归的类型化决策模型。一�
 | `model` | BERT、题型嵌入、一层 Transformer 头、每个标记一个 logit |
 | `data` | 读取 `LocalLLaMA/typed-decisions` 配置 `all`，按案例切出校准集 |
 | `batch` | 把变长序列补到长度桶，把选项轴补齐 |
-| `train` | 训练、按校准集 soft CE 选 epoch、在官方 test 上打分 |
+| `train` | 训练并在官方 test 上打分。缺省损失是 soft CE；`loss=rlcd` 时改走 RLCD |
+| `rlcd` | 恰当评分奖励，以及 logit 噪声上的组内 REINFORCE |
 | `calibrate` | 每种题型在 0.5 到 5.0 上网格搜索温度 |
 | `metrics` | 准确率、KL、Brier、ECE，以及数据集卡上的对照数字 |
 | `predict` | 加载检查点，返回与训练共用的答案对象 |
@@ -64,17 +65,19 @@ logit 只从 `[MASK]` 读取。选项一个都不能丢。题干加选项先限�
 
 ## 损失与温度
 
-训练损失是软标签交叉熵：
+`python -m minilaya train` 的损失是软标签交叉熵。命令行不设置 `loss`，`train()` 看到的就是 soft CE：
 
 ```text
 - sum_k gold_k * log softmax(logit)_k
 ```
 
-只在真实选项上求和。金标已经是分布，所以用 soft CE，而不是 RLCD。Laya 的 RLCD 在其 issue #741 里没有带来收益，且有一次纯 soft CE 高于 RLCD。
+只在真实选项上求和。每个 epoch 结束时在校准集上算未调温度的 soft CE，保留最低的那一版权重。
 
-每个 epoch 结束时在校准集上算未调温度的 soft CE，保留最低的那一版权重。校准集在任何梯度之前划出，按工作流分层，默认 10%，且按案例而不是按题目切，避免同一案例的题目漏进两边。默认得到训练 1080 个案例 / 5400 条决策，校准 120 / 600。
+RLCD 由 `scripts/train_rlcd.py` 把 `args.loss` 设为 `rlcd` 后调用同一个 `train()`。奖励与 Laya 的 `proper_reward` 一致：对数分 + 0.5 × 球面分，`score` 题再减 1.0 × 排名概率分，对数项下限 -9.21。每题采样 4 个 logit 高斯噪声，标准差从 1.0 线性降到 0.3；优势是这 4 个奖励减去组内均值，REINFORCE 把高于均值的报告拉向当前 logit。选 epoch 用校准集上未加噪声的奖励，取得分最高的一轮。typed-decisions 没有多轮轨迹，也没有 act / escalate 标签，所以这一路不含 TD(λ) 和动作头。默认输出目录是 `runs/bert-typed-decisions-rlcd`。
 
-温度在校准集上按题型网格搜索，范围 `[0.5, 5.0]`、46 个点，目标仍是 soft CE。某题型校准样本少于 8 条时温度保持 1。正的标量温度不改变 argmax，因此准确率不变，KL、Brier、ECE 会变。当前检查点的拟合结果：choice 1.2，score 1.2，noul 1.3。
+校准集在任何梯度之前划出，按工作流分层，默认 10%，且按案例而不是按题目切，避免同一案例的题目漏进两边。默认得到训练 1080 个案例 / 5400 条决策，校准 120 / 600。两条路径共用这一刀。
+
+温度在校准集上按题型网格搜索，范围 `[0.5, 5.0]`、46 个点，目标是 soft CE。某题型校准样本少于 8 条时温度保持 1。正的标量温度不改变 argmax，因此准确率不变，KL、Brier、ECE 会变。soft CE 检查点的拟合结果：choice 1.2，score 1.2，noul 1.3。RLCD 检查点：choice 1.1，score 1.1，noul 1.2。温度仍按题型一个标量，没有按选项数分桶。
 
 ## 推理输出
 

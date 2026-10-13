@@ -1,0 +1,483 @@
+"""
+RLCD (Reinforcement Learning for Calibrated Decisions) PyTorch 实现
+简化版：训练一个模型对多选题输出校准的概率分布
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple
+
+# ==================== 配置 ====================
+
+@dataclass
+class RLCDConfig:
+    vocab_size: int = 1000
+    embed_dim: int = 64
+    hidden_dim: int = 128
+    num_options: int = 4          # 选项数量（如 A/B/C/D）
+    max_seq_len: int = 32
+    lr: float = 1e-4
+    group_size: int = 8           # 每个样本采样多少个 rollout
+    noise_std: float = 0.1        # logits 上的高斯噪声标准差（探索）
+    temperature: float = 1.0      # 温度参数
+    epochs: int = 10
+    batch_size: int = 16
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ==================== 数据集 ====================
+
+class DecisionDataset(Dataset):
+    """
+    每条数据：一段文本 + 正确答案的选项索引
+    """
+    def __init__(self, texts: List[torch.Tensor], labels: List[int]):
+        self.texts = texts
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.texts[idx], self.labels[idx]
+
+
+# ==================== 模型 ====================
+
+class DecisionModel(nn.Module):
+    """
+    简化决策模型：
+    编码文本 -> 对每个选项输出一个 logit
+    实际场景中可用 BERT/ModernBERT 替换编码器
+    """
+    def __init__(self, config: RLCDConfig):
+        super().__init__()
+        self.config = config
+
+        # 文本编码器（简化版：Embedding + 平均池化）
+        self.embedding = nn.Embedding(config.vocab_size, config.embed_dim, padding_idx=0)
+
+        # 决策头：从文本表示映射到 num_options 个 logits
+        self.decision_head = nn.Sequential(
+            nn.Linear(config.embed_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.num_options),
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input_ids: [B, seq_len]
+        Returns:
+            logits: [B, num_options]  每个选项的未归一化分数
+        """
+        # 编码文本
+        emb = self.embedding(input_ids)               # [B, seq_len, embed_dim]
+        mask = (input_ids != 0).float().unsqueeze(-1) # [B, seq_len, 1]
+        pooled = (emb * mask).sum(1) / mask.sum(1).clamp(min=1e-9)  # [B, embed_dim]
+
+        # 输出每个选项的 logit
+        logits = self.decision_head(pooled)            # [B, num_options]
+        return logits
+
+    def get_probs(self, input_ids: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+        """返回 softmax 后的概率分布"""
+        logits = self.forward(input_ids)
+        return F.softmax(logits / temperature, dim=-1)
+
+
+# ==================== 严格恰当评分规则 ====================
+
+def brier_score(probs: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor:
+    """
+    Brier 分数（严格恰当评分规则）：
+    衡量概率分布与真实 one-hot 标签之间的均方误差。
+    值越小越好，期望值唯一地被真实分布最小化。
+
+    Args:
+        probs: [B, C] 模型输出的概率分布
+        target_idx: [B] 正确选项的索引
+    Returns:
+        score: [B] 每个样本的 Brier 分数（越小越好）
+    """
+    B, C = probs.shape
+    one_hot = F.one_hot(target_idx, num_classes=C).float()  # [B, C]
+    # 对每个样本计算 (p - y)^2 的和
+    brier = ((probs - one_hot) ** 2).sum(dim=-1)  # [B]
+    return brier
+
+
+def log_score(probs: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor:
+    """
+    对数分数（另一种严格恰当评分规则）：
+    -log(p_true)，值越小越好。
+    """
+    true_probs = probs.gather(1, target_idx.unsqueeze(1)).squeeze(1)  # [B]
+    return -torch.log(true_probs.clamp(min=1e-9))
+
+
+# ==================== RLCD 训练器 ====================
+
+class RLCDTrainer:
+    """
+    RLCD 训练器：
+    1. 对同一输入采样 G 个带噪声的 rollout
+    2. 用恰当评分规则计算每个 rollout 的奖励
+    3. 用 REINFORCE + group-mean baseline 更新策略
+    """
+    def __init__(self, model: DecisionModel, config: RLCDConfig):
+        self.model = model
+        self.config = config
+        self.device = torch.device(config.device)
+        self.model.to(self.device)
+
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+
+    def compute_reward(self, probs: torch.Tensor, target_idx: torch.Tensor) -> torch.Tensor:
+        """
+        奖励 = -(Brier 分数)，越大越好。
+        也可以组合多种恰当评分规则。
+        """
+        brier = brier_score(probs, target_idx)
+        return -brier  # 负 Brier，越大越好
+
+    def rollout(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        对一个 batch 的输入采样 G 个 rollout。
+        每个 rollout 在 logits 上添加独立的高斯噪声以探索不同的概率分布。
+
+        Returns:
+            probs_all: [B, G, C] 每个 rollout 的概率分布
+            log_probs_all: [B, G] 每个 rollout 的对数概率（用于策略梯度）
+        """
+        B = input_ids.size(0)
+        G = self.config.group_size
+        C = self.config.num_options
+
+        # 重复输入 G 次：[B*G, seq_len]
+        input_ids_rep = input_ids.repeat_interleave(G, dim=0)
+
+        # 前向传播得到基础 logits
+        with torch.no_grad():
+            base_logits = self.model(input_ids_rep)  # [B*G, C]
+
+        # 在 logits 上加噪声，探索不同的分布
+        noise = torch.randn_like(base_logits) * self.config.noise_std
+        perturbed_logits = base_logits + noise
+
+        # 计算概率分布（带温度）
+        probs = F.softmax(perturbed_logits / self.config.temperature, dim=-1)  # [B*G, C]
+        probs_all = probs.view(B, G, C)  # [B, G, C]
+
+        # 计算 log 概率（用于 REINFORCE）
+        log_probs = F.log_softmax(perturbed_logits / self.config.temperature, dim=-1)
+        # 取正确选项的 log 概率
+        target_rep = target_idx.repeat_interleave(G)  # [B*G]
+        log_prob_selected = log_probs.gather(1, target_rep.unsqueeze(1)).squeeze(1)  # [B*G]
+        log_probs_all = log_prob_selected.view(B, G)  # [B, G]
+
+        return probs_all, log_probs_all
+
+    def train_step(self, input_ids: torch.Tensor, target_idx: torch.Tensor) -> dict:
+        """
+        单步训练：
+        1. 采样 G 个 rollout
+        2. 计算每个 rollout 的奖励
+        3. 计算 group-mean baseline
+        4. 用 REINFORCE 更新策略
+        """
+        B = input_ids.size(0)
+        G = self.config.group_size
+
+        # ---- 1. 采样 rollout ----
+        probs_all, log_probs_all = self.rollout(input_ids)  # [B,G,C], [B,G]
+
+        # ---- 2. 计算奖励 ----
+        # 扩展 target_idx 以匹配 rollout 维度
+        target_expanded = target_idx.unsqueeze(1).expand(B, G)  # [B, G]
+        rewards = self.compute_reward(
+            probs_all.view(B * G, -1),
+            target_expanded.reshape(-1)
+        ).view(B, G)  # [B, G]
+
+        # ---- 3. Group-mean baseline ----
+        # 每个样本的 G 个 rollout 共享一个基线（类似 GRPO）
+        baseline = rewards.mean(dim=1, keepdim=True)  # [B, 1]
+        advantages = rewards - baseline                # [B, G]
+
+        # 标准化优势（可选，稳定训练）
+        adv_std = advantages.std(dim=1, keepdim=True).clamp(min=1e-6)
+        advantages = advantages / adv_std
+
+        # ---- 4. 策略梯度损失 ----
+        # REINFORCE: L = -E[advantage * log_prob]
+        # 只对优势为正的 rollout 做梯度上升（可选，类似 RLOO）
+        policy_loss = -(advantages.detach() * log_probs_all).mean()
+
+        # ---- 5. 反向传播 ----
+        self.optimizer.zero_grad()
+        policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        # ---- 统计 ----
+        with torch.no_grad():
+            # 用无噪声的预测评估准确率
+            clean_probs = self.model.get_probs(input_ids, self.config.temperature)
+            preds = clean_probs.argmax(dim=-1)
+            acc = (preds == target_idx).float().mean().item()
+            avg_reward = rewards.mean().item()
+
+        return {
+            "loss": policy_loss.item(),
+            "reward": avg_reward,
+            "accuracy": acc,
+        }
+
+
+# ==================== 温度校准（训练后） ====================
+
+def calibrate_temperature(model: DecisionModel, val_loader: DataLoader,
+                          device: str = "cuda", max_iter: int = 100) -> float:
+    """
+    训练后温度校准：
+    在验证集上优化温度参数 T，使 NLL 最小。
+    """
+    model.eval()
+    # 可学习的温度参数
+    log_T = torch.zeros(1, requires_grad=True, device=device)
+    optimizer = torch.optim.LBFGS([log_T], lr=0.1, max_iter=max_iter)
+
+    all_logits = []
+    all_targets = []
+
+    with torch.no_grad():
+        for input_ids, target_idx in val_loader:
+            input_ids = input_ids.to(device)
+            target_idx = target_idx.to(device)
+            logits = model(input_ids)
+            all_logits.append(logits)
+            all_targets.append(target_idx)
+
+    all_logits = torch.cat(all_logits, dim=0)      # [N, C]
+    all_targets = torch.cat(all_targets, dim=0)    # [N]
+
+    def closure():
+        optimizer.zero_grad()
+        T = log_T.exp().clamp(min=0.01, max=100.0)
+        probs = F.softmax(all_logits / T, dim=-1)
+        nll = F.nll_loss(torch.log(probs.clamp(min=1e-9)), all_targets)
+        nll.backward()
+        return nll
+
+    optimizer.step(closure)
+
+    final_T = log_T.exp().item()
+    model.train()
+    return final_T
+
+
+# ==================== 评估指标 ====================
+
+def compute_ece(probs: torch.Tensor, targets: torch.Tensor, n_bins: int = 10) -> float:
+    """
+    期望校准误差 (ECE)：
+    衡量模型声称的置信度与实际准确率之间的差距。
+    """
+    confidences, predictions = probs.max(dim=-1)
+    accuracies = (predictions == targets).float()
+
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    total = len(targets)
+
+    for i in range(n_bins):
+        lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
+        mask = (confidences > lo) & (confidences <= hi)
+        if mask.sum() > 0:
+            avg_conf = confidences[mask].mean()
+            avg_acc = accuracies[mask].mean()
+            ece += (mask.sum().float() / total) * (avg_conf - avg_acc).abs()
+
+    return ece.item()
+
+
+@torch.no_grad()
+def evaluate(model: DecisionModel, loader: DataLoader, device: str = "cuda") -> dict:
+    """评估模型的准确率和校准误差"""
+    model.eval()
+    all_probs = []
+    all_targets = []
+
+    for input_ids, target_idx in loader:
+        input_ids = input_ids.to(device)
+        probs = model.get_probs(input_ids)
+        all_probs.append(probs.cpu())
+        all_targets.append(target_idx)
+
+    all_probs = torch.cat(all_probs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    acc = (all_probs.argmax(dim=-1) == all_targets).float().mean().item()
+    ece = compute_ece(all_probs, all_targets)
+    avg_brier = brier_score(all_probs, all_targets).mean().item()
+    avg_nll = log_score(all_probs, all_targets).mean().item()
+
+    return {
+        "accuracy": acc,
+        "ece": ece,
+        "brier": avg_brier,
+        "nll": avg_nll,
+    }
+
+
+# ==================== 完整训练流程 ====================
+
+def generate_dummy_data(n_samples: int = 1000, config: RLCDConfig = None):
+    """
+    生成模拟数据用于演示。
+    实际使用时替换为真实文本和标签。
+    """
+    if config is None:
+        config = RLCDConfig()
+
+    texts = []
+    labels = []
+    for _ in range(n_samples):
+        seq_len = np.random.randint(5, config.max_seq_len)
+        text = torch.randint(1, config.vocab_size, (seq_len,))
+        # 用序列的第一个 token 模 num_options 决定正确答案（模拟可学习模式）
+        label = int(text[0].item() % config.num_options)
+        texts.append(text)
+        labels.append(label)
+
+    return texts, labels
+
+
+def collate_fn(batch):
+    """将变长序列 padding 到相同长度"""
+    texts, labels = zip(*batch)
+    max_len = max(len(t) for t in texts)
+    padded = torch.zeros(len(texts), max_len, dtype=torch.long)
+    for i, t in enumerate(texts):
+        padded[i, :len(t)] = t
+    return padded, torch.tensor(labels, dtype=torch.long)
+
+
+def main():
+    config = RLCDConfig()
+    device = config.device
+
+    # ---- 准备数据 ----
+    texts, labels = generate_dummy_data(2000, config)
+    split = int(len(texts) * 0.8)
+
+    train_dataset = DecisionDataset(texts[:split], labels[:split])
+    val_dataset = DecisionDataset(texts[split:], labels[split:])
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size,
+                              shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size,
+                            shuffle=False, collate_fn=collate_fn)
+
+    # ---- 初始化模型和训练器 ----
+    model = DecisionModel(config)
+    trainer = RLCDTrainer(model, config)
+
+    # ---- 训练前评估 ----
+    print("=" * 60)
+    print("训练前评估（随机初始化）")
+    print("=" * 60)
+    metrics = evaluate(model, val_loader, device)
+    for k, v in metrics.items():
+        print(f"  {k:10s}: {v:.4f}")
+
+    # ---- RLCD 训练 ----
+    print("\n" + "=" * 60)
+    print("开始 RLCD 训练")
+    print("=" * 60)
+
+    for epoch in range(config.epochs):
+        model.train()
+        epoch_loss = 0.0
+        epoch_reward = 0.0
+        epoch_acc = 0.0
+        n_batches = 0
+
+        for input_ids, target_idx in train_loader:
+            input_ids = input_ids.to(device)
+            target_idx = target_idx.to(device)
+
+            stats = trainer.train_step(input_ids, target_idx)
+
+            epoch_loss += stats["loss"]
+            epoch_reward += stats["reward"]
+            epoch_acc += stats["accuracy"]
+            n_batches += 1
+
+        print(f"Epoch {epoch+1:3d}/{config.epochs} | "
+              f"Loss: {epoch_loss/n_batches:.4f} | "
+              f"Reward: {epoch_reward/n_batches:.4f} | "
+              f"Train Acc: {epoch_acc/n_batches:.4f}")
+
+    # ---- 训练后评估 ----
+    print("\n" + "=" * 60)
+    print("训练后评估（未校准）")
+    print("=" * 60)
+    metrics = evaluate(model, val_loader, device)
+    for k, v in metrics.items():
+        print(f"  {k:10s}: {v:.4f}")
+
+    # ---- 温度校准 ----
+    print("\n" + "=" * 60)
+    print("温度校准")
+    print("=" * 60)
+    best_T = calibrate_temperature(model, val_loader, device)
+    print(f"  校准温度 T = {best_T:.4f}")
+
+    # 用校准后的温度重新评估
+    model.eval()
+    all_probs = []
+    all_targets = []
+    with torch.no_grad():
+        for input_ids, target_idx in val_loader:
+            input_ids = input_ids.to(device)
+            logits = model(input_ids)
+            probs = F.softmax(logits / best_T, dim=-1)
+            all_probs.append(probs.cpu())
+            all_targets.append(target_idx)
+
+    all_probs = torch.cat(all_probs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+
+    print("\n" + "=" * 60)
+    print("校准后评估")
+    print("=" * 60)
+    print(f"  {'accuracy':10s}: {(all_probs.argmax(-1) == all_targets).float().mean().item():.4f}")
+    print(f"  {'ece':10s}: {compute_ece(all_probs, all_targets):.4f}")
+    print(f"  {'brier':10s}: {brier_score(all_probs, all_targets).mean().item():.4f}")
+    print(f"  {'nll':10s}: {log_score(all_probs, all_targets).mean().item():.4f}")
+
+    # ---- 选择性预测演示 ----
+    print("\n" + "=" * 60)
+    print("选择性预测（覆盖率 vs 错误率）")
+    print("=" * 60)
+    confidences = all_probs.max(dim=-1)[0]
+    correct = (all_probs.argmax(-1) == all_targets).float()
+
+    for threshold in [0.5, 0.7, 0.8, 0.9, 0.95]:
+        mask = confidences >= threshold
+        coverage = mask.float().mean().item()
+        if mask.sum() > 0:
+            error_rate = 1 - correct[mask].mean().item()
+        else:
+            error_rate = 0.0
+        print(f"  阈值 {threshold:.2f} | 覆盖率 {coverage:.3f} | 错误率 {error_rate:.3f}")
+
+
+if __name__ == "__main__":
+    main()

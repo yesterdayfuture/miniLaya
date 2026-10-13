@@ -1,6 +1,6 @@
 """训练、评估和 Laya 形式推理的命令行。
 
-train 会微调并在官方 test 上写 benchmark.json。
+train 用 soft CE 微调，并在官方 test 上写 benchmark.json。RLCD 走 scripts/train_rlcd.py。
 eval 只重打已有检查点。
 predict 对一条 state 输出 answers；--demo 使用官方 test 的一条案例。
 """
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    train_parser = sub.add_parser("train", help="微调并在官方 test 上评估")
+    train_parser = sub.add_parser("train", help="用 soft CE 微调，并在官方 test 上评估")
     train_parser.add_argument("--model", default="bert-base-uncased")
     train_parser.add_argument("--output", default="runs/bert-typed-decisions")
     train_parser.add_argument("--epochs", type=int, default=3)

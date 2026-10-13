@@ -17,6 +17,8 @@ python3 -m venv .venv
 
 ## 训练
 
+普通微调是金标分布上的 soft cross-entropy。`python -m minilaya train` 不传损失开关，走的就是这条路径，检查点默认写到 `runs/bert-typed-decisions`。
+
 ```bash
 PYTHONPATH=. .venv/bin/python -m minilaya train \
   --model bert-base-uncased \
@@ -27,9 +29,17 @@ PYTHONPATH=. .venv/bin/python -m minilaya train \
   --head-max-len 256
 ```
 
-只读取数据集配置 `all`（train 1200 个案例，test 400 个案例）。不要把四个工作流配置再加进来，否则会重复计数。
+RLCD 是另一次运行，调用同一个 `train()`，只把损失换成恰当评分上的组内 REINFORCE。检查点默认写到 `runs/bert-typed-decisions-rlcd`，不会覆盖上面的 soft CE 检查点。
 
-训练前按工作流分层，从 train 里留出 10% 案例做温度校准。官方 test 不参与训练，也不参与温度拟合。MPS 上编码器启用 gradient checkpointing。
+```bash
+PYTHONPATH=. .venv/bin/python scripts/train_rlcd.py \
+  --epochs 6 \
+  --batch-size 8
+```
+
+两条命令都只读取数据集配置 `all`（train 1200 个案例，test 400 个案例）。不要把四个工作流配置再加进来，否则会重复计数。
+
+训练前按工作流分层，从 train 里留出 10% 案例做温度校准。官方 test 不参与训练，也不参与温度拟合。MPS 上编码器启用 gradient checkpointing。soft CE 按校准集 soft CE 选 epoch；RLCD 按校准集上未加噪声的奖励选 epoch。温度拟合两边都用 soft CE。
 
 检查点目录：
 
@@ -42,7 +52,7 @@ PYTHONPATH=. .venv/bin/python -m minilaya train \
 | `predictions.jsonl` | 每条测试决策的校准后概率 |
 | `demo_predict.json` | 测试集第一条的 Laya 形式预测与金标 |
 
-已有一次完整运行的结果在 `runs/bert-typed-decisions`（该目录被 git 忽略）。
+已有两次完整运行，目录都被 git 忽略：soft CE 在 `runs/bert-typed-decisions`，RLCD 在 `runs/bert-typed-decisions-rlcd`。`eval` 和 `predict` 换 `--checkpoint` 就能读另一份。
 
 ## 评估
 
@@ -92,6 +102,13 @@ python scripts/bench_infer.py --checkpoint runs/bert-typed-decisions
 
 ## 本次 test 结果
 
-2000 条官方测试决策，6 个 epoch 的检查点校准后准确率 0.648，KL 0.193，Brier 0.109，ECE 0.084。分题型准确率：choice 0.580，noul 0.747，score 0.625。
+下面两行都是 2000 条官方测试决策、6 个 epoch、校准之后的分数。soft CE 是 `runs/bert-typed-decisions`，RLCD 是 `runs/bert-typed-decisions-rlcd`。
+
+| 损失 | 准确率 | KL | Brier | ECE |
+|---|---:|---:|---:|---:|
+| soft CE | 0.648 | 0.193 | 0.109 | 0.084 |
+| RLCD | 0.572 | 0.259 | 0.145 | 0.071 |
+
+soft CE 分题型准确率：choice 0.580，noul 0.747，score 0.625。RLCD：choice 0.523，noul 0.672，score 0.532。分数 MAE（只在 800 条 score 上）soft CE 0.360，RLCD 0.462。
 
 同一次官方 test 上，Jev 1.13.0 公布准确率 0.727，Laya typed-decisions 公布 0.766，数据集卡上的 ModernBERT-base 分工作流专家是 0.646。Laya 的分题型准确率是 choice 0.733、noul 0.857、score 0.723。Jev 没有公布分题型数字。Apple M1 上热身后的单题推理 p50 是 33.7 ms；Laya 英文检查点在 Tesla T4 上的对应公布值是 39.5 ms。设备、检查点和计时口径不同，完整对照在 [docs/comparison.md](docs/comparison.md)。

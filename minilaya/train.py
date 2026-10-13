@@ -1,7 +1,9 @@
 """在 typed-decisions 上微调 BERT，并只在官方 test 上打分。
 
-流程：先在 test 上算均匀分布和先验，确认评分器；再训练；每个 epoch 用未调温度的
-校准 soft CE 选权重；最后在校准集上拟合温度，对 test 打一次分。
+`python -m minilaya train` 不设置 loss，训练损失是金标分布上的 soft CE，
+按校准集上未调温度的 soft CE 选权重。`scripts/train_rlcd.py` 把 loss 设为 rlcd
+后再调用同一个 train()：奖励是恰当评分，按校准集上未加噪声的奖励选权重。
+两条路径都先在 test 上算均匀分布和先验，最后在校准集上拟合温度，再对 test 打一次分。
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from minilaya.metrics import (
 )
 from minilaya.model import DecisionBert, soft_ce_loss
 from minilaya.predict import DecisionAgent, format_answers, probabilities_from_logits, resolve_device, save_checkpoint
+from minilaya.rlcd import mean_proper_reward, noise_std_at, rlcd_loss
 from minilaya.schema import QTYPES, target_from_gold
 
 
@@ -161,7 +164,16 @@ def _cat_marker(parts: Sequence[torch.Tensor], pad_value) -> torch.Tensor:
 
 
 def mean_loss(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    """校准集上的 soft CE。两条训练路径都记这一项，方便和 soft CE 运行对照。"""
     return float(soft_ce_loss(logits, target, mask).item())
+
+
+def uses_rlcd(args) -> bool:
+    """命令行 train 不带 loss 属性，getattr 落到 soft_ce，普通微调保持原样。
+
+    只有 scripts/train_rlcd.py 会把 args.loss 写成 "rlcd"。
+    """
+    return getattr(args, "loss", "soft_ce") == "rlcd"
 
 
 def rows_from_logits(
@@ -351,16 +363,31 @@ def train(args) -> Dict[str, Any]:
     from transformers import get_linear_schedule_with_warmup
 
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
+    rlcd = uses_rlcd(args)
+    if rlcd:
+        print(
+            "损失  RLCD  组大小 %d  噪声 %.2f → %.2f"
+            % (args.rlcd_group, args.rlcd_noise_start, args.rlcd_noise_end)
+        )
+    # best_loss 两条路径都存「被选中那一轮」的校准 soft CE。
+    # best_reward 只在 RLCD 下有值，是同一轮未加噪声的恰当评分。
     best_loss = None
+    best_reward = None
     best_state = None
     history = []
     started = time.time()
+    # 校准集的题型顺序和 collect_output 的行序一致，后面算奖励时按这个下标对齐。
+    calib_qtype = torch.tensor([QTYPES[item.qtype] for item in calib_examples], dtype=torch.long)
     for epoch in range(args.epochs):
         model.train()
         loader = _loader(fit_examples, args.batch_size, pad_id, shuffle=True, seed=args.seed + epoch, fixed_len=args.max_len)
         running = 0.0
+        running_reward = 0.0
         seen = 0
+        epoch_noise = None
         for step, batch in enumerate(loader, start=1):
+            # 噪声按全程步数退火，不在每个 epoch 重新从起点开始。
+            global_step = epoch * steps_per_epoch + step
             logits = model(
                 batch["input_ids"].to(device),
                 batch["attention_mask"].to(device),
@@ -368,7 +395,23 @@ def train(args) -> Dict[str, Any]:
                 batch["marker_mask"].to(device),
                 batch["qtype"].to(device),
             )
-            loss = soft_ce_loss(logits, batch["target"].to(device), batch["marker_mask"].to(device))
+            target = batch["target"].to(device)
+            marker_mask = batch["marker_mask"].to(device)
+            if rlcd:
+                epoch_noise = noise_std_at(global_step, total_steps, args.rlcd_noise_start, args.rlcd_noise_end)
+                loss, stats = rlcd_loss(
+                    logits,
+                    target,
+                    marker_mask,
+                    batch["qtype"].to(device),
+                    group_size=args.rlcd_group,
+                    noise_std=epoch_noise,
+                )
+                # stats["reward"] 已是本 batch 的均值，乘上条数后再除以 seen，得到按样本平均的奖励。
+                running_reward += stats["reward"] * batch["input_ids"].size(0)
+            else:
+                # 默认路径。命令行 train 进这里，损失是金标分布上的交叉熵。
+                loss = soft_ce_loss(logits, target, marker_mask)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
@@ -380,20 +423,47 @@ def train(args) -> Dict[str, Any]:
                 # 同步后再打日志，避免打印时 GPU 还停在上一 step。
                 torch.mps.synchronize()
             if step == 1 or step % args.log_every == 0 or step == steps_per_epoch:
-                print(
-                    "  epoch %d/%d  step %d/%d  loss %.4f  len %d"
-                    % (epoch + 1, args.epochs, step, steps_per_epoch, running / seen, batch["input_ids"].size(1)),
-                    flush=True,
+                message = "  epoch %d/%d  step %d/%d  loss %.4f  len %d" % (
+                    epoch + 1,
+                    args.epochs,
+                    step,
+                    steps_per_epoch,
+                    running / seen,
+                    batch["input_ids"].size(1),
                 )
+                if rlcd:
+                    message += "  reward %.4f  noise %.3f" % (running_reward / seen, epoch_noise)
+                print(message, flush=True)
         calib_logits, calib_target, calib_mask = collect_output(
             model, calib_examples, device, args.batch_size, pad_id, fixed_len=args.max_len
         )
         calib_loss = mean_loss(calib_logits, calib_target, calib_mask)
-        # 选模用未调温度的校准损失。温度要等最佳权重量好后再拟合，不能每个 epoch 都在同一批 logit 上挑 T。
-        history.append({"epoch": epoch + 1, "train_loss": running / max(seen, 1), "calib_loss": calib_loss})
-        print("epoch %d  训练损失 %.4f  校准损失 %.4f" % (epoch + 1, history[-1]["train_loss"], calib_loss))
-        if best_loss is None or calib_loss < best_loss:
+        # 温度要等最佳权重量好后再拟合，不能每个 epoch 都在同一批 logit 上挑 T。
+        # soft CE 选校准交叉熵最低的一轮。RLCD 选未加噪声的恰当评分最高的一轮。
+        record = {"epoch": epoch + 1, "train_loss": running / max(seen, 1), "calib_loss": calib_loss}
+        calib_reward = None
+        if rlcd:
+            calib_reward = mean_proper_reward(calib_logits, calib_target, calib_mask, calib_qtype)
+            record["train_reward"] = running_reward / max(seen, 1)
+            record["calib_reward"] = calib_reward
+            record["noise_std"] = epoch_noise
+        history.append(record)
+        if rlcd:
+            print(
+                "epoch %d  RLCD损失 %.4f  训练奖励 %.4f  校准奖励 %.4f  校准 soft CE %.4f"
+                % (epoch + 1, record["train_loss"], record["train_reward"], calib_reward, calib_loss)
+            )
+        else:
+            print("epoch %d  训练损失 %.4f  校准损失 %.4f" % (epoch + 1, record["train_loss"], calib_loss))
+        if rlcd:
+            # 奖励越大越好。相等时留着旧权重，避免来回替换。
+            chosen = best_reward is None or calib_reward > best_reward
+        else:
+            # soft CE 越小越好。
+            chosen = best_loss is None or calib_loss < best_loss
+        if chosen:
             best_loss = calib_loss
+            best_reward = calib_reward
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             # 中途崩溃时还能从这里恢复权重。正式检查点仍是训练结束后的 safetensors。
             torch.save(best_state, output / "best_state.pt")
@@ -434,6 +504,12 @@ def train(args) -> Dict[str, Any]:
         "epochs": args.epochs,
         "best_calib_loss": best_loss,
     }
+    if rlcd:
+        config["loss"] = "rlcd"
+        config["rlcd_group"] = args.rlcd_group
+        config["rlcd_noise_start"] = args.rlcd_noise_start
+        config["rlcd_noise_end"] = args.rlcd_noise_end
+        config["best_calib_reward"] = best_reward
     save_checkpoint(output, model, tokenizer, config)
     benchmark = {
         "model_name": args.model,
@@ -451,7 +527,13 @@ def train(args) -> Dict[str, Any]:
         "baseline_prior": {key: prior_summary[key] for key in ("accuracy", "kl", "brier", "ece", "n")},
         "published": PUBLISHED,
         "seconds": time.time() - started,
-        "note": "模型在 train 上微调，校准温度来自 train 内部留出集。测试集只用于最终打分。准确率与零样本 Jev 不可直接比高低。",
+        "loss": "rlcd" if rlcd else "soft_ce",
+        "note": (
+            "RLCD：对数分 + 0.5×球面分，score 题减排名概率分。组内噪声报告用 REINFORCE 更新。"
+            "按校准集上未加噪声的奖励选 epoch。温度仍在校准集上按 soft CE 拟合。测试集只用于最终打分。"
+            if rlcd
+            else "模型在 train 上微调，校准温度来自 train 内部留出集。测试集只用于最终打分。准确率与零样本 Jev 不可直接比高低。"
+        ),
     }
     with open(output / "benchmark.json", "w", encoding="utf-8") as handle:
         json.dump(benchmark, handle, ensure_ascii=False, indent=2)

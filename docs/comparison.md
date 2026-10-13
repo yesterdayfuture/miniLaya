@@ -6,7 +6,7 @@
 |---|---|---|---|
 | Jev 1.13.0 | 通用决策接口 | 未公开 | 零样本。数字来自 [laya-typed-decisions 模型卡](https://huggingface.co/convaiinnovations/laya-typed-decisions)，Laya 标明是第三方公布，没有在同一套提示上重测 |
 | Laya typed-decisions | 这四个工作流上的专家 | ModernBERT-large，421M，上下文 1024 | 在 1200 个训练案例上用 RLCD 微调。模型卡自称，数据集讨论区把它标成 self-reported |
-| miniLaya | 这四个工作流上的专家 | bert-base-uncased，110M，上下文 512 | 本仓库在 train 上用 soft CE 微调。校准集从 train 按案例留出，test 只打一次分 |
+| miniLaya | 这四个工作流上的专家 | bert-base-uncased，110M，上下文 512 | 本仓库在 train 上用 soft CE 微调。校准集从 train 按案例留出，test 只打一次分。下面各表的 miniLaya 都是这一份，`runs/bert-typed-decisions` |
 
 Jev 没见过这些工作流的训练标签。Laya 和 miniLaya 见过。数据集卡把这两种分数分成 generalist 和 specialist，并排时要带上这一列。教师自一致准确率是 0.735。Laya 的 0.766 高于这个上限。
 
@@ -64,6 +64,30 @@ Laya 的分题型表只有准确率和 ECE。两边的 ECE 不必逐项对齐：
 | agent_trace_observability | 0.580 | 0.730 | 0.150 |
 
 差距最大的仍是 agent trace。这一版准确率 0.580，已经高于本仓库算出的全体先验 0.481。
+
+## 同设置下的 RLCD
+
+`python -m minilaya train` 仍是上面的 soft CE。`scripts/train_rlcd.py` 调用同一个 `train()`，损失换成对数分 + 0.5 × 球面分，`score` 题再减排名概率分；每题 4 个噪声样本，标准差从 1.0 降到 0.3。数据切分、骨干、6 个 epoch、batch 8 与 soft CE 那次相同。检查点在 `runs/bert-typed-decisions-rlcd`。选中的是第 6 个 epoch。校准温度 choice 1.1、score 1.1、noul 1.2。
+
+| | 准确率 | Brier | ECE | 分数 MAE | KL |
+|---|---:|---:|---:|---:|---:|
+| miniLaya soft CE | 0.648 | 0.109 | 0.084 | 0.360 | 0.193 |
+| miniLaya RLCD | 0.572 | 0.145 | 0.071 | 0.462 | 0.259 |
+
+RLCD 校准后准确率低 0.076，KL 高 0.066，Brier 高 0.036，分数 MAE 高 0.102。ECE 低 0.013。温度 = 1 时 RLCD 的准确率仍是 0.572，KL 0.263，Brier 0.146，ECE 0.057。
+
+| 题型 | RLCD 准确率 | RLCD ECE | RLCD KL | RLCD Brier | n |
+|---|---:|---:|---:|---:|---:|
+| choice | 0.523 | 0.100 | 0.333 | 0.161 | 600 |
+| noul | 0.672 | 0.054 | 0.165 | 0.133 | 600 |
+| score | 0.532 | 0.101 | 0.274 | 0.143 | 800 |
+
+| 工作流 | RLCD 准确率 | n |
+|---|---:|---:|
+| invoice_processing | 0.618 | 500 |
+| security_incidents | 0.662 | 500 |
+| customer_service | 0.600 | 500 |
+| agent_trace_observability | 0.406 | 500 |
 
 ## 推理速度
 
